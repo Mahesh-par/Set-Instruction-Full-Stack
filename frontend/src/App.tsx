@@ -1,12 +1,16 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   ArrowUpRight,
+  Check,
+  CheckSquare,
   ClipboardList,
   Database,
   Pencil,
   Loader2,
   RefreshCw,
-  Save
+  Save,
+  Square,
+  X
 } from "lucide-react";
 
 type DashboardView = "instructions" | "notion";
@@ -36,11 +40,18 @@ type InstructionResponse = {
   };
 };
 
+type AutomationResponse = {
+  success: boolean;
+  message: string;
+};
+
 type StoredNotionRows = {
   count: number;
   fetchedAt: string | null;
   rows: NotionRow[];
 };
+
+type AutomationStatus = "running" | "success" | "error";
 
 const DASHBOARD_VIEW_KEY = "set-instructions-dashboard-view";
 const NOTION_ROWS_CACHE_KEY = "set-instructions-notion-rows-v2";
@@ -152,6 +163,20 @@ function App() {
   const [instructionMessage, setInstructionMessage] = useState<string | null>(
     null
   );
+  const [selectedPageIds, setSelectedPageIds] = useState<Set<string>>(
+    () => new Set()
+  );
+  const [automationStatus, setAutomationStatus] = useState<
+    Record<string, AutomationStatus>
+  >({});
+  const [isAutomationRunning, setIsAutomationRunning] = useState(false);
+  const [automationMessage, setAutomationMessage] = useState<string | null>(
+    null
+  );
+
+  const selectedRows = rows.filter((row) => selectedPageIds.has(row.pageId));
+  const selectedCount = selectedRows.length;
+  const allRowsSelected = rows.length > 0 && selectedCount === rows.length;
 
   const selectView = (view: DashboardView) => {
     localStorage.setItem(DASHBOARD_VIEW_KEY, view);
@@ -197,10 +222,15 @@ function App() {
       setRows(nextRows);
       setRowCount(nextCount);
       setHasFetched(true);
+      setSelectedPageIds(new Set());
+      setAutomationStatus({});
+      setAutomationMessage(null);
       saveStoredNotionRows(nextRows, nextCount, payload.fetchedAt ?? null);
     } catch (fetchError) {
       setRows([]);
       setRowCount(0);
+      setSelectedPageIds(new Set());
+      setAutomationStatus({});
       setError(
         fetchError instanceof Error
           ? fetchError.message
@@ -288,6 +318,197 @@ function App() {
       );
     } finally {
       setIsInstructionSaving(false);
+    }
+  };
+
+  const fetchInstructionForAutomation = async (): Promise<string> => {
+    if (savedInstruction.trim()) {
+      return savedInstruction.trim();
+    }
+
+    const response = await fetch(getApiUrl("/api/claude/instructions"));
+    const payload = await parseApiResponse<InstructionResponse>(
+      response,
+      "Failed to fetch saved instruction."
+    );
+
+    if (!response.ok || payload.success === false) {
+      throw new Error(payload.message || "Failed to fetch saved instruction.");
+    }
+
+    const nextInstruction = payload.data?.instruction?.trim() ?? "";
+
+    if (!nextInstruction) {
+      throw new Error("Save an instruction before running automation.");
+    }
+
+    setInstruction(nextInstruction);
+    setSavedInstruction(nextInstruction);
+    setIsInstructionEditing(false);
+
+    return nextInstruction;
+  };
+
+  const toggleRowSelection = (pageId: string) => {
+    if (isAutomationRunning) {
+      return;
+    }
+
+    setSelectedPageIds((currentPageIds) => {
+      const nextPageIds = new Set(currentPageIds);
+
+      if (nextPageIds.has(pageId)) {
+        nextPageIds.delete(pageId);
+      } else {
+        nextPageIds.add(pageId);
+      }
+
+      return nextPageIds;
+    });
+  };
+
+  const selectAllRows = () => {
+    if (isAutomationRunning) {
+      return;
+    }
+
+    setSelectedPageIds(
+      allRowsSelected ? new Set() : new Set(rows.map((row) => row.pageId))
+    );
+  };
+
+  const runSelectedAutomation = async () => {
+    const queue = rows.filter((row) => selectedPageIds.has(row.pageId));
+
+    if (queue.length === 0) {
+      setAutomationMessage("Select at least one row first.");
+      return;
+    }
+
+    setIsAutomationRunning(true);
+    setError(null);
+    setAutomationMessage(null);
+    setAutomationStatus((currentStatus) => {
+      const nextStatus = { ...currentStatus };
+
+      for (const row of queue) {
+        delete nextStatus[row.pageId];
+      }
+
+      return nextStatus;
+    });
+
+    let successCount = 0;
+    let errorCount = 0;
+
+    try {
+      const savedInstructionText = await fetchInstructionForAutomation();
+
+      for (const row of queue) {
+        setAutomationStatus((currentStatus) => ({
+          ...currentStatus,
+          [row.pageId]: "running"
+        }));
+
+        try {
+          const response = await fetch(
+            getApiUrl("/api/claude/instructions/open"),
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({
+                claudeLink: row.url,
+                instruction: savedInstructionText
+              })
+            }
+          );
+          const payload = await parseApiResponse<AutomationResponse>(
+            response,
+            "Failed to set instruction."
+          );
+
+          if (!response.ok || payload.success === false) {
+            throw new Error(payload.message || "Failed to set instruction.");
+          }
+
+          successCount += 1;
+          setAutomationStatus((currentStatus) => ({
+            ...currentStatus,
+            [row.pageId]: "success"
+          }));
+        } catch {
+          errorCount += 1;
+          setAutomationStatus((currentStatus) => ({
+            ...currentStatus,
+            [row.pageId]: "error"
+          }));
+        }
+      }
+
+      setAutomationMessage(
+        `Automation complete. ${successCount} succeeded, ${errorCount} failed.`
+      );
+    } catch (automationError) {
+      setAutomationMessage(
+        automationError instanceof Error
+          ? automationError.message
+          : "Automation failed to start."
+      );
+    } finally {
+      setIsAutomationRunning(false);
+    }
+  };
+
+  const retryRowAutomation = async (row: NotionRow) => {
+    if (isAutomationRunning) {
+      return;
+    }
+
+    setIsAutomationRunning(true);
+    setAutomationMessage(null);
+    setAutomationStatus((currentStatus) => ({
+      ...currentStatus,
+      [row.pageId]: "running"
+    }));
+
+    try {
+      const savedInstructionText = await fetchInstructionForAutomation();
+      const response = await fetch(getApiUrl("/api/claude/instructions/open"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          claudeLink: row.url,
+          instruction: savedInstructionText
+        })
+      });
+      const payload = await parseApiResponse<AutomationResponse>(
+        response,
+        "Failed to set instruction."
+      );
+
+      if (!response.ok || payload.success === false) {
+        throw new Error(payload.message || "Failed to set instruction.");
+      }
+
+      setAutomationStatus((currentStatus) => ({
+        ...currentStatus,
+        [row.pageId]: "success"
+      }));
+      setAutomationMessage("Retry succeeded.");
+    } catch (retryError) {
+      setAutomationStatus((currentStatus) => ({
+        ...currentStatus,
+        [row.pageId]: "error"
+      }));
+      setAutomationMessage(
+        retryError instanceof Error ? retryError.message : "Retry failed."
+      );
+    } finally {
+      setIsAutomationRunning(false);
     }
   };
 
@@ -442,18 +663,48 @@ function App() {
                       : "No rows fetched yet"}
                   </p>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => fetchNotionRows(true)}
-                  disabled={isLoading}
-                  className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-zinc-300 bg-white px-3 text-sm font-medium text-zinc-800 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-70"
-                >
-                  <RefreshCw
-                    className={`h-4 w-4 ${isLoading ? "animate-spin" : ""}`}
-                    aria-hidden="true"
-                  />
-                  Refresh
-                </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={selectAllRows}
+                    disabled={isLoading || isAutomationRunning || rows.length === 0}
+                    className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-zinc-300 bg-white px-3 text-sm font-medium text-zinc-800 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-70"
+                  >
+                    <CheckSquare className="h-4 w-4" aria-hidden="true" />
+                    {allRowsSelected ? "Clear All" : "Select All"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={runSelectedAutomation}
+                    disabled={
+                      isLoading || isAutomationRunning || selectedCount === 0
+                    }
+                    className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-teal-700 bg-teal-700 px-3 text-sm font-medium text-white transition hover:bg-teal-800 disabled:cursor-not-allowed disabled:opacity-70"
+                  >
+                    {isAutomationRunning ? (
+                      <Loader2
+                        className="h-4 w-4 animate-spin"
+                        aria-hidden="true"
+                      />
+                    ) : (
+                      <Save className="h-4 w-4" aria-hidden="true" />
+                    )}
+                    Set Instructions
+                    {selectedCount > 0 ? ` (${selectedCount})` : ""}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => fetchNotionRows(true)}
+                    disabled={isLoading || isAutomationRunning}
+                    className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-zinc-300 bg-white px-3 text-sm font-medium text-zinc-800 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-70"
+                  >
+                    <RefreshCw
+                      className={`h-4 w-4 ${isLoading ? "animate-spin" : ""}`}
+                      aria-hidden="true"
+                    />
+                    Refresh
+                  </button>
+                </div>
               </div>
 
               {error ? (
@@ -462,22 +713,34 @@ function App() {
                 </div>
               ) : null}
 
+              {automationMessage ? (
+                <div className="m-4 rounded-md border border-zinc-200 bg-zinc-50 px-4 py-3 text-sm text-zinc-700">
+                  {automationMessage}
+                </div>
+              ) : null}
+
               <div className="overflow-x-auto">
                 <table className="min-w-full divide-y divide-zinc-200 text-sm">
                   <thead className="bg-zinc-100 text-left text-xs font-semibold uppercase text-zinc-600">
                     <tr>
+                      <th className="w-12 whitespace-nowrap px-4 py-3">
+                        Select
+                      </th>
                       <th className="whitespace-nowrap px-4 py-3">Name</th>
                       <th className="whitespace-nowrap px-4 py-3">
                         Client Name
                       </th>
                       <th className="whitespace-nowrap px-4 py-3">Project URL</th>
+                      <th className="w-20 whitespace-nowrap px-4 py-3">
+                        Done
+                      </th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-zinc-100 bg-white">
                     {isLoading ? (
                       <tr>
                         <td
-                          colSpan={3}
+                          colSpan={5}
                           className="px-4 py-10 text-center text-zinc-500"
                         >
                           Loading Notion rows...
@@ -486,6 +749,29 @@ function App() {
                     ) : rows.length > 0 ? (
                       rows.map((row) => (
                         <tr key={row.pageId} className="hover:bg-zinc-50">
+                          <td className="whitespace-nowrap px-4 py-3">
+                            <button
+                              type="button"
+                              onClick={() => toggleRowSelection(row.pageId)}
+                              disabled={isAutomationRunning}
+                              aria-label={`Select ${formatCell(
+                                row.clientName
+                              )}`}
+                              className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-zinc-300 bg-white text-zinc-700 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-70"
+                            >
+                              {selectedPageIds.has(row.pageId) ? (
+                                <CheckSquare
+                                  className="h-4 w-4 text-teal-700"
+                                  aria-hidden="true"
+                                />
+                              ) : (
+                                <Square
+                                  className="h-4 w-4"
+                                  aria-hidden="true"
+                                />
+                              )}
+                            </button>
+                          </td>
                           <td className="whitespace-nowrap px-4 py-3 font-medium text-zinc-950">
                             {formatCell(row.name)}
                           </td>
@@ -506,12 +792,42 @@ function App() {
                               />
                             </a>
                           </td>
+                          <td className="whitespace-nowrap px-4 py-3">
+                            {automationStatus[row.pageId] === "running" ? (
+                              <Loader2
+                                className="h-4 w-4 animate-spin text-teal-700"
+                                aria-hidden="true"
+                              />
+                            ) : automationStatus[row.pageId] === "success" ? (
+                              <Check
+                                className="h-5 w-5 text-emerald-600"
+                                aria-hidden="true"
+                              />
+                            ) : automationStatus[row.pageId] === "error" ? (
+                              <div className="flex items-center gap-2">
+                                <X
+                                  className="h-5 w-5 text-red-600"
+                                  aria-hidden="true"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => retryRowAutomation(row)}
+                                  disabled={isAutomationRunning}
+                                  className="inline-flex h-8 items-center justify-center rounded-md border border-red-200 bg-white px-2 text-xs font-medium text-red-700 transition hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-70"
+                                >
+                                  Retry
+                                </button>
+                              </div>
+                            ) : (
+                              <span className="text-zinc-300">-</span>
+                            )}
+                          </td>
                         </tr>
                       ))
                     ) : (
                       <tr>
                         <td
-                          colSpan={3}
+                          colSpan={5}
                           className="px-4 py-10 text-center text-zinc-500"
                         >
                           {hasFetched
